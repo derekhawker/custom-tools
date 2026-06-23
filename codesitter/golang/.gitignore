@@ -1,0 +1,23 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/codesitter
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Generated codesitter index
+.codesitter/
+
+# Local environment
+.env
+.env.*
