@@ -4,9 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	csslang "github.com/smacker/go-tree-sitter/css"
 	golang "github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/java"
 	"github.com/smacker/go-tree-sitter/javascript"
@@ -16,6 +18,10 @@ import (
 
 	"github.com/derekhawker/codesitter/internal/store"
 )
+
+var stylesheetVariableRE = regexp.MustCompile(`^[\t ]*(\$[-_a-zA-Z][-\w]*|--[-_a-zA-Z][-\w]*)[\t ]*:`)
+var stylesheetMixinRE = regexp.MustCompile(`^[\t ]*@mixin[\t ]+([-_a-zA-Z][-\w]*)`)
+var stylesheetFunctionRE = regexp.MustCompile(`^[\t ]*@function[\t ]+([-_a-zA-Z][-\w]*)`)
 
 type Options struct {
 	RootPath string
@@ -134,6 +140,12 @@ func allowedExts(langs []string) map[string]struct{} {
 			out[".java"] = struct{}{}
 		case "rs", "rust":
 			out[".rs"] = struct{}{}
+		case "css":
+			out[".css"] = struct{}{}
+		case "scss":
+			out[".scss"] = struct{}{}
+		case "sass":
+			out[".sass"] = struct{}{}
 		}
 	}
 	return out
@@ -153,6 +165,12 @@ func extToLanguage(ext string) (string, bool) {
 		return "java", true
 	case ".rs":
 		return "rust", true
+	case ".css":
+		return "css", true
+	case ".scss":
+		return "scss", true
+	case ".sass":
+		return "sass", true
 	default:
 		return "", false
 	}
@@ -188,6 +206,8 @@ func languageFor(lang string) *sitter.Language {
 		return tsxlang.GetLanguage()
 	case "rs", "rust":
 		return rustlang.GetLanguage()
+	case "css", "scss", "sass":
+		return csslang.GetLanguage()
 	default:
 		return javascript.GetLanguage()
 	}
@@ -195,6 +215,10 @@ func languageFor(lang string) *sitter.Language {
 
 func walkSymbols(n *sitter.Node, src []byte, relPath, lang string, out *[]store.SymbolRecord) {
 	if n == nil {
+		return
+	}
+	if isStylesheetLanguage(lang) {
+		walkStylesheetSymbols(n, src, relPath, lang, out)
 		return
 	}
 
@@ -283,6 +307,144 @@ func walkSymbols(n *sitter.Node, src []byte, relPath, lang string, out *[]store.
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		walkSymbols(n.NamedChild(i), src, relPath, lang, out)
 	}
+}
+
+func isStylesheetLanguage(lang string) bool {
+	switch lang {
+	case "css", "scss", "sass":
+		return true
+	default:
+		return false
+	}
+}
+
+func walkStylesheetSymbols(n *sitter.Node, src []byte, relPath, lang string, out *[]store.SymbolRecord) {
+	if n == nil {
+		return
+	}
+
+	switch n.Type() {
+	case "rule_set":
+		if selectors := stylesheetChildByType(n, "selectors"); selectors != nil {
+			addSymbol(*&out, relPath, lang, strings.TrimSpace(nodeText(src, selectors)), "selector", n, src)
+		}
+	case "declaration":
+		if property := stylesheetChildByType(n, "property_name"); property != nil {
+			name := strings.TrimSpace(nodeText(src, property))
+			if strings.HasPrefix(name, "--") {
+				addSymbol(*&out, relPath, lang, name, "variable", n, src)
+			}
+		}
+	case "keyframes_statement":
+		if name := stylesheetChildByType(n, "keyframes_name"); name != nil {
+			addSymbol(*&out, relPath, lang, strings.TrimSpace(nodeText(src, name)), "keyframes", n, src)
+		}
+	case "mixin_statement":
+		addStylesheetNamedSymbol(n, src, relPath, lang, "mixin", out)
+	case "function_statement":
+		addStylesheetNamedSymbol(n, src, relPath, lang, "function", out)
+	}
+
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		walkStylesheetSymbols(n.NamedChild(i), src, relPath, lang, out)
+	}
+
+	if n.Type() == "stylesheet" {
+		addStylesheetSourceSymbols(src, relPath, lang, out)
+	}
+}
+
+func stylesheetChildByType(n *sitter.Node, nodeType string) *sitter.Node {
+	for i := 0; i < int(n.NamedChildCount()); i++ {
+		child := n.NamedChild(i)
+		if child != nil && child.Type() == nodeType {
+			return child
+		}
+	}
+	return nil
+}
+
+func addStylesheetNamedSymbol(n *sitter.Node, src []byte, relPath, lang, kind string, out *[]store.SymbolRecord) {
+	name := n.ChildByFieldName("name")
+	if name == nil {
+		name = stylesheetChildByType(n, "identifier")
+	}
+	if name == nil {
+		return
+	}
+	addSymbol(*&out, relPath, lang, strings.TrimSpace(nodeText(src, name)), kind, n, src)
+}
+
+func addStylesheetSourceSymbols(src []byte, relPath, lang string, out *[]store.SymbolRecord) {
+	for lineNumber, line := range strings.Split(string(src), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if match := stylesheetVariableRE.FindStringSubmatch(line); len(match) > 1 {
+			addSourceSymbol(out, relPath, lang, match[1], "variable", lineNumber+1, trimmed)
+		}
+		if match := stylesheetMixinRE.FindStringSubmatch(line); len(match) > 1 {
+			addSourceSymbol(out, relPath, lang, match[1], "mixin", lineNumber+1, trimmed)
+		}
+		if match := stylesheetFunctionRE.FindStringSubmatch(line); len(match) > 1 {
+			addSourceSymbol(out, relPath, lang, match[1], "function", lineNumber+1, trimmed)
+		}
+	}
+
+	if lang == "sass" {
+		addIndentedSassSelectors(src, relPath, lang, out)
+	}
+}
+
+func addIndentedSassSelectors(src []byte, relPath, lang string, out *[]store.SymbolRecord) {
+	for lineNumber, line := range strings.Split(string(src), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "$") || strings.HasPrefix(trimmed, "@") || strings.HasPrefix(trimmed, "+") || strings.HasPrefix(trimmed, "=") {
+			continue
+		}
+		if sassDeclarationLine(trimmed) {
+			continue
+		}
+		name := strings.TrimSuffix(trimmed, ",")
+		if name == "" || strings.ContainsAny(name, "{};") {
+			continue
+		}
+		addSourceSymbol(out, relPath, lang, name, "selector", lineNumber+1, trimmed)
+	}
+}
+
+func sassDeclarationLine(line string) bool {
+	colon := strings.IndexByte(line, ':')
+	if colon < 1 {
+		return false
+	}
+	if colon == len(line)-1 {
+		return true
+	}
+	next := line[colon+1]
+	return next == ' ' || next == '\t'
+}
+
+func addSourceSymbol(out *[]store.SymbolRecord, relPath, lang, name, kind string, line int, signature string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	for _, existing := range *out {
+		if existing.Name == name && existing.Kind == kind && existing.StartLine == line {
+			return
+		}
+	}
+	*out = append(*out, store.SymbolRecord{
+		RelPath:   relPath,
+		Name:      name,
+		Kind:      kind,
+		StartLine: line,
+		EndLine:   line,
+		Signature: signature,
+		Language:  lang,
+	})
 }
 
 func rustMethodNode(n *sitter.Node) bool {

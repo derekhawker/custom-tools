@@ -29,7 +29,7 @@ export default tool({
     action: tool.schema.enum(["status", "index", "query"]).describe("codesitter command to run"),
     path: tool.schema.string().optional().describe("Project path. Defaults to the current opencode worktree or directory."),
     force: tool.schema.boolean().optional().describe("Allow indexing to run. Required by codesitter for index action."),
-    lang: tool.schema.string().optional().describe("Comma-separated language filters for indexing, for example: js,ts,tsx,go,java,rust"),
+    lang: tool.schema.string().optional().describe("Comma-separated language filters for indexing, for example: js,ts,tsx,go,java,rust,css,scss,sass"),
     include: tool.schema.string().optional().describe("Include glob for indexing"),
     exclude: tool.schema.string().optional().describe("Additional exclude glob for indexing; common dependency and build directories are skipped by default."),
     maxFiles: tool.schema.number().int().positive().optional().describe("Maximum files to index"),

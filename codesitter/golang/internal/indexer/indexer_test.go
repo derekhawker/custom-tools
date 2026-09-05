@@ -40,6 +40,75 @@ func TestScanSkipsDependencyAndGeneratedDirectories(t *testing.T) {
 	}
 }
 
+func TestScanSupportsStylesheetExtensions(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"styles.css": `:root {
+  --primary: #336699;
+}
+
+.button {
+  color: var(--primary);
+}`,
+		"theme.scss": `$primary: #336699;
+
+@mixin rounded($radius) {
+  border-radius: $radius;
+}
+
+.card {
+  @include rounded(4px);
+}`,
+		"legacy.sass": `$spacing: 1rem
+.card
+  padding: $spacing
+`,
+		"ignored.ts": "export function ignored() {}\n",
+	}
+	for relPath, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(relPath))
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := Scan(Options{RootPath: root, Langs: []string{"css", "scss", "sass"}})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(result.Files) != 3 {
+		t.Fatalf("expected three stylesheet files, got %#v", result.Files)
+	}
+
+	wantLanguages := map[string]string{
+		"styles.css":  "css",
+		"theme.scss":  "scss",
+		"legacy.sass": "sass",
+	}
+	for _, file := range result.Files {
+		if file.Language != wantLanguages[file.RelPath] {
+			t.Errorf("expected %s to be identified as %s, got %q", file.RelPath, wantLanguages[file.RelPath], file.Language)
+		}
+	}
+
+	wantSymbols := map[string]map[string]string{
+		"styles.css":  {".button": "selector", "--primary": "variable"},
+		"theme.scss":  {".card": "selector", "$primary": "variable", "rounded": "mixin"},
+		"legacy.sass": {".card": "selector", "$spacing": "variable"},
+	}
+	for file, symbols := range wantSymbols {
+		got := map[string]string{}
+		for _, symbol := range result.Symbols[file] {
+			got[symbol.Name] = symbol.Kind
+		}
+		for name, kind := range symbols {
+			if got[name] != kind {
+				t.Errorf("expected stylesheet symbol %q in %s to have kind %q, got %q", name, file, kind, got[name])
+			}
+		}
+	}
+}
+
 func TestScanExtractsRustSymbols(t *testing.T) {
 	root := t.TempDir()
 	source := `mod api {

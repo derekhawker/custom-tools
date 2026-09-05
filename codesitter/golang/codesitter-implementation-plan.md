@@ -1,6 +1,6 @@
 # Codesitter Go Implementation Plan
 
-This plan tracks implementation of a Go-based wrapper around Tree-sitter for project indexing and semantic code queries across JavaScript, TypeScript, Go, Java, and Rust.
+This plan tracks implementation of a Go-based wrapper around Tree-sitter for project indexing and semantic code queries across JavaScript, TypeScript, Go, Java, Rust, CSS, SCSS, and Sass.
 
 ## Goals
 
@@ -30,7 +30,7 @@ This plan tracks implementation of a Go-based wrapper around Tree-sitter for pro
 - [x] Parse args: `--path`, `--force`, `--incremental`, `--lang`, `--include`, `--exclude`, `--max-files`, `--json`.
 - [x] If `--force` is missing, return warning, `requires_force=true`, and exit code `2`.
 - [x] Walk files with filters and language detection.
-- [x] Support JavaScript, TypeScript, Go, Java, and Rust file detection and parsing.
+- [x] Support JavaScript, TypeScript, Go, Java, Rust, CSS, SCSS, and Sass file detection and parsing.
 - [x] Compute file hash/mtime and detect changed/deleted files.
 - [x] Parse changed files via Tree-sitter and extract symbols/relations.
 - [x] Persist index run stats and print `IndexResponse`.
@@ -69,6 +69,7 @@ This plan tracks implementation of a Go-based wrapper around Tree-sitter for pro
 ```bash
 codesitter index --path ~/programs/javascript/homepage --force --lang js,ts,tsx --json
 codesitter index --path ~/programs/rust/project --force --lang rust --json
+codesitter index --path ~/programs/web/styles --force --lang css,scss,sass --json
 codesitter status --path ~/programs/javascript/homepage --json
 codesitter query find_declarations --path ~/programs/javascript/homepage --symbol renderPage --limit 20 --json
 ```
