@@ -1,14 +1,23 @@
 # codesitter
 
-`codesitter` is a Go CLI wrapper for indexing JavaScript/TypeScript repositories and running semantic-style code queries.
+`codesitter` is a Go CLI wrapper for indexing JavaScript, TypeScript, Go, Java, and Rust repositories and running semantic-style code queries.
 
 ## Features
 
 - Safe indexing guard: `index` requires `--force`.
 - Incremental file indexing by content hash.
 - Persistent SQLite index under `.codesitter/index.db`.
+- Tree-sitter symbol extraction for supported languages.
 - Query intents for declarations, references, callers, callees, file outlines, and importers.
 - JSON output for LLM/tool integration.
+
+## Supported languages
+
+- JavaScript: `js`, `javascript` (`.js`, `.mjs`, `.cjs`)
+- TypeScript: `ts`, `typescript` (`.ts`), and `tsx` (`.tsx`)
+- Go: `go`, `golang` (`.go`)
+- Java: `java` (`.java`)
+- Rust: `rs`, `rust` (`.rs`)
 
 ## Build
 
@@ -22,6 +31,7 @@ Index a project:
 
 ```bash
 ./codesitter index --path ~/programs/javascript/homepage --force --lang js,ts,tsx --json
+./codesitter index --path ~/programs/rust/project --force --lang rust --json
 ```
 
 Indexing automatically prunes common dependency, cache, metadata, and generated-output directories at any depth, including `node_modules`, `vendor`, `bower_components`, `jspm_packages`, `dist`, `out`, `build`, `target`, and `coverage`. A supplied `--exclude` pattern adds file-level exclusions to these defaults.
@@ -61,5 +71,5 @@ Run queries:
 
 ## Notes
 
-- Current symbol extraction is lightweight pattern-based parsing.
-- Tree-sitter parser integration is planned for deeper and more accurate extraction.
+- Symbol extraction uses Tree-sitter and is intentionally lightweight.
+- Relations are currently inferred with lightweight source-text matching.

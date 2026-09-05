@@ -53,7 +53,7 @@ func runIndex(args []string, stdout, stderr io.Writer) int {
 	forceFlag := fs.Bool("force", false, "required to run indexing")
 	jsonFlag := fs.Bool("json", false, "output as JSON")
 	_ = fs.Bool("incremental", true, "incremental indexing")
-	langFlag := fs.String("lang", "", "language filter list")
+	langFlag := fs.String("lang", "", "language filter list (js, ts, tsx, go, java, rust)")
 	includeFlag := fs.String("include", "", "include glob")
 	excludeFlag := fs.String("exclude", "", "exclude glob")
 	maxFilesFlag := fs.Int("max-files", 0, "max files to index")

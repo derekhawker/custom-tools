@@ -10,6 +10,7 @@ import (
 	golang "github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/java"
 	"github.com/smacker/go-tree-sitter/javascript"
+	rustlang "github.com/smacker/go-tree-sitter/rust"
 	tsxlang "github.com/smacker/go-tree-sitter/typescript/tsx"
 	tslang "github.com/smacker/go-tree-sitter/typescript/typescript"
 
@@ -131,6 +132,8 @@ func allowedExts(langs []string) map[string]struct{} {
 			out[".go"] = struct{}{}
 		case "java":
 			out[".java"] = struct{}{}
+		case "rs", "rust":
+			out[".rs"] = struct{}{}
 		}
 	}
 	return out
@@ -148,6 +151,8 @@ func extToLanguage(ext string) (string, bool) {
 		return "go", true
 	case ".java":
 		return "java", true
+	case ".rs":
+		return "rust", true
 	default:
 		return "", false
 	}
@@ -181,6 +186,8 @@ func languageFor(lang string) *sitter.Language {
 		return tslang.GetLanguage()
 	case "tsx":
 		return tsxlang.GetLanguage()
+	case "rs", "rust":
+		return rustlang.GetLanguage()
 	default:
 		return javascript.GetLanguage()
 	}
@@ -234,11 +241,60 @@ func walkSymbols(n *sitter.Node, src []byte, relPath, lang string, out *[]store.
 				addSymbol(*&out, relPath, lang, name, "variable_function", n, src)
 			}
 		}
+	case "function_item", "function_signature_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		kind := "function"
+		if lang == "rust" && rustMethodNode(n) {
+			kind = "method"
+		}
+		addSymbol(*&out, relPath, lang, name, kind, n, src)
+	case "struct_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "struct", n, src)
+	case "union_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "union", n, src)
+	case "enum_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "enum", n, src)
+	case "trait_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "trait", n, src)
+	case "type_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "type", n, src)
+	case "const_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "constant", n, src)
+	case "static_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "static", n, src)
+	case "mod_item":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "module", n, src)
+	case "macro_definition":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "macro", n, src)
+	case "associated_type":
+		name := nodeText(src, n.ChildByFieldName("name"))
+		addSymbol(*&out, relPath, lang, name, "type", n, src)
 	}
 
 	for i := 0; i < int(n.NamedChildCount()); i++ {
 		walkSymbols(n.NamedChild(i), src, relPath, lang, out)
 	}
+}
+
+func rustMethodNode(n *sitter.Node) bool {
+	for parent := n.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.Type() {
+		case "impl_item", "trait_item":
+			return true
+		case "source_file":
+			return false
+		}
+	}
+	return false
 }
 
 func matchesGlob(pattern, relPath string, emptyMatches bool) bool {

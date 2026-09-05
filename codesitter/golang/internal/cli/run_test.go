@@ -162,6 +162,85 @@ func TestIndexGoDeclarations(t *testing.T) {
 	}
 }
 
+func TestIndexRustDeclarations(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "lib.rs"), []byte("use crate::{\n    service::Service,\n};\n\npub struct Server {}\n\nimpl Server {\n    pub fn start(&self) {}\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	code := Run([]string{"index", "--path", root, "--force", "--lang", "rust", "--json"}, &out, &errOut)
+	if code != ExitOK {
+		t.Fatalf("index expected code %d, got %d, stderr=%s", ExitOK, code, errOut.String())
+	}
+
+	var idx model.IndexResponse
+	if err := json.Unmarshal(out.Bytes(), &idx); err != nil {
+		t.Fatalf("unmarshal index response: %v", err)
+	}
+	if idx.Stats == nil || idx.Stats.FilesScanned != 1 {
+		t.Fatalf("expected one Rust file scanned, got %#v", idx.Stats)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"query", "find_declarations", "--path", root, "--symbol", "Server", "--json"}, &out, &errOut)
+	if code != ExitOK {
+		t.Fatalf("query expected code %d, got %d, stderr=%s", ExitOK, code, errOut.String())
+	}
+
+	var queryResp model.QueryResponse
+	if err := json.Unmarshal(out.Bytes(), &queryResp); err != nil {
+		t.Fatalf("unmarshal query response: %v", err)
+	}
+	if len(queryResp.Results) != 1 || queryResp.Results[0].Language != "rust" || queryResp.Results[0].Kind != "struct" {
+		t.Fatalf("expected one Rust struct declaration, got %#v", queryResp.Results)
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Run([]string{"query", "find_importers", "--path", root, "--module", "service::Service", "--json"}, &out, &errOut)
+	if code != ExitOK {
+		t.Fatalf("importer query expected code %d, got %d, stderr=%s", ExitOK, code, errOut.String())
+	}
+
+	var importResp model.QueryResponse
+	if err := json.Unmarshal(out.Bytes(), &importResp); err != nil {
+		t.Fatalf("unmarshal importer response: %v", err)
+	}
+	if len(importResp.Results) != 1 || importResp.Results[0].Language != "rust" || importResp.Results[0].Kind != "import" {
+		t.Fatalf("expected one Rust importer result, got %#v", importResp.Results)
+	}
+}
+
+func TestFindImportersPreservesJavaImports(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Main.java"), []byte("import com.example.Service;\n\nclass Main {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	if code := Run([]string{"index", "--path", root, "--force", "--lang", "java", "--json"}, &out, &errOut); code != ExitOK {
+		t.Fatalf("index expected code %d, got %d, stderr=%s", ExitOK, code, errOut.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	if code := Run([]string{"query", "find_importers", "--path", root, "--module", "com.example.Service", "--json"}, &out, &errOut); code != ExitOK {
+		t.Fatalf("importer query expected code %d, got %d, stderr=%s", ExitOK, code, errOut.String())
+	}
+
+	var resp model.QueryResponse
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal importer response: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Language != "java" {
+		t.Fatalf("expected one Java importer result, got %#v", resp.Results)
+	}
+}
+
 func TestQueryNotIndexed(t *testing.T) {
 	root := t.TempDir()
 

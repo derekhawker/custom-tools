@@ -47,7 +47,16 @@ type SymbolRecord struct {
 }
 
 var importRE = regexp.MustCompile(`^\s*import\s+.*?from\s+['\"]([^'\"]+)['\"]|^\s*import\s+['\"]([^'\"]+)['\"]`)
-var callRE = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+var rustUseRE = regexp.MustCompile(`^\s*(pub(\([^)]*\))?\s+)?use\s+([^;]+);`)
+var callRE = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*!?\s*\(`)
+
+var rustUseStartRE = regexp.MustCompile(`^\s*(pub(\([^)]*\))?\s+)?use\b`)
+
+type rustUseStatement struct {
+	Module    string
+	Signature string
+	StartLine int
+}
 
 type IndexStats struct {
 	FilesScanned     int
@@ -446,23 +455,15 @@ func RecomputeRelations(db *sql.DB, projectPath string) error {
 
 	for _, f := range files {
 		full := filepath.Join(projectPath, f.RelPath)
-		fd, err := os.Open(full)
+		source, err := os.ReadFile(full)
 		if err != nil {
 			continue
 		}
-		s := bufio.NewScanner(fd)
+		sourceText := string(source)
+		s := bufio.NewScanner(strings.NewReader(sourceText))
 		for s.Scan() {
 			line := s.Text()
-			for _, m := range importRE.FindAllStringSubmatch(line, -1) {
-				mod := ""
-				if len(m) > 1 && m[1] != "" {
-					mod = m[1]
-				} else if len(m) > 2 {
-					mod = m[2]
-				}
-				if mod == "" {
-					continue
-				}
+			for _, mod := range importedModules(line) {
 				_, _ = db.Exec(`INSERT INTO relations(root_path, from_symbol_id, to_symbol_id, type) VALUES (?, NULL, NULL, ?)`, projectPath, "imports:"+mod)
 			}
 			for _, cm := range callRE.FindAllStringSubmatch(line, -1) {
@@ -482,7 +483,11 @@ func RecomputeRelations(db *sql.DB, projectPath string) error {
 				_, _ = db.Exec(`INSERT INTO relations(root_path, from_symbol_id, to_symbol_id, type) VALUES (?, ?, ?, 'calls')`, projectPath, fromID, toID)
 			}
 		}
-		_ = fd.Close()
+		if f.Language == "rust" {
+			for _, use := range rustUseStatements(sourceText) {
+				_, _ = db.Exec(`INSERT INTO relations(root_path, from_symbol_id, to_symbol_id, type) VALUES (?, NULL, NULL, ?)`, projectPath, "imports:"+use.Module)
+			}
+		}
 		_ = s.Err()
 	}
 
@@ -552,11 +557,25 @@ func FindImporters(db *sql.DB, projectPath, module string, limit int) ([]SymbolR
 			continue
 		}
 		lines := strings.Split(string(b), "\n")
+		fileResults := []SymbolRecord{}
 		for i, line := range lines {
 			if !strings.Contains(line, module) || !strings.Contains(line, "import") {
 				continue
 			}
-			out = append(out, SymbolRecord{RelPath: f.RelPath, Name: module, Kind: "import", StartLine: i + 1, EndLine: i + 1, Signature: strings.TrimSpace(line), Language: f.Language})
+			fileResults = append(fileResults, SymbolRecord{RelPath: f.RelPath, Name: module, Kind: "import", StartLine: i + 1, EndLine: i + 1, Signature: strings.TrimSpace(line), Language: f.Language})
+		}
+		if f.Language == "rust" {
+			for _, use := range rustUseStatements(string(b)) {
+				if strings.Contains(use.Module, module) {
+					fileResults = append(fileResults, SymbolRecord{RelPath: f.RelPath, Name: module, Kind: "import", StartLine: use.StartLine, EndLine: use.StartLine, Signature: use.Signature, Language: f.Language})
+				}
+			}
+		}
+		sort.SliceStable(fileResults, func(i, j int) bool {
+			return fileResults[i].StartLine < fileResults[j].StartLine
+		})
+		for _, result := range fileResults {
+			out = append(out, result)
 			if len(out) >= limit {
 				return out, nil
 			}
@@ -592,6 +611,54 @@ func FindReferences(db *sql.DB, projectPath, symbol string, limit int) ([]Symbol
 		}
 	}
 	return out, nil
+}
+
+func rustUseStatements(source string) []rustUseStatement {
+	lines := strings.Split(source, "\n")
+	statements := []rustUseStatement{}
+	current := strings.Builder{}
+	startLine := 0
+
+	for i, line := range lines {
+		if startLine == 0 {
+			if !rustUseStartRE.MatchString(line) {
+				continue
+			}
+			startLine = i + 1
+		}
+		if current.Len() > 0 {
+			current.WriteByte(' ')
+		}
+		current.WriteString(strings.TrimSpace(line))
+		if !strings.Contains(line, ";") {
+			continue
+		}
+
+		statement := strings.TrimSpace(current.String())
+		if match := rustUseRE.FindStringSubmatch(statement); len(match) > 3 && strings.TrimSpace(match[3]) != "" {
+			statements = append(statements, rustUseStatement{Module: strings.TrimSpace(match[3]), Signature: statement, StartLine: startLine})
+		}
+		current.Reset()
+		startLine = 0
+	}
+
+	return statements
+}
+
+func importedModules(line string) []string {
+	out := []string{}
+	for _, m := range importRE.FindAllStringSubmatch(line, -1) {
+		mod := ""
+		if len(m) > 1 && m[1] != "" {
+			mod = m[1]
+		} else if len(m) > 2 {
+			mod = m[2]
+		}
+		if mod != "" {
+			out = append(out, mod)
+		}
+	}
+	return out
 }
 
 func migrate(db *sql.DB) error {
