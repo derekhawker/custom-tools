@@ -40,6 +40,46 @@ func TestScanSkipsDependencyAndGeneratedDirectories(t *testing.T) {
 	}
 }
 
+func TestScanSupportsJavaScriptModuleExtensions(t *testing.T) {
+	root := t.TempDir()
+
+	files := map[string]string{
+		"common.cjs": "function loadCommon() {}\nmodule.exports = { loadCommon }\n",
+		"module.mjs": "export function loadModule() {}\n",
+		"legacy.js":  "function loadLegacy() {}\n",
+		"types.ts":   "export function notJavaScript() {}\n",
+	}
+	for relPath, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(relPath))
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := Scan(Options{RootPath: root, Langs: []string{"js"}})
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if len(result.Files) != 3 {
+		t.Fatalf("expected three JavaScript files, got %#v", result.Files)
+	}
+
+	wantSymbols := map[string]string{
+		"common.cjs": "loadCommon",
+		"module.mjs": "loadModule",
+		"legacy.js":  "loadLegacy",
+	}
+	for _, file := range result.Files {
+		if file.Language != "javascript" {
+			t.Errorf("expected %s to be identified as JavaScript, got %q", file.RelPath, file.Language)
+		}
+		if len(result.Symbols[file.RelPath]) != 1 || result.Symbols[file.RelPath][0].Name != wantSymbols[file.RelPath] {
+			t.Errorf("expected JavaScript symbol %q in %s, got %#v", wantSymbols[file.RelPath], file.RelPath, result.Symbols[file.RelPath])
+		}
+	}
+}
+
 func TestScanSupportsStylesheetExtensions(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
