@@ -24,6 +24,8 @@ Index a project:
 ./codesitter index --path ~/programs/javascript/homepage --force --lang js,ts,tsx --json
 ```
 
+Indexing automatically prunes common dependency, cache, metadata, and generated-output directories at any depth, including `node_modules`, `vendor`, `bower_components`, `jspm_packages`, `dist`, `out`, `build`, `target`, and `coverage`. A supplied `--exclude` pattern adds file-level exclusions to these defaults.
+
 Check index status:
 
 ```bash

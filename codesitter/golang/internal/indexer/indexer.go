@@ -29,6 +29,33 @@ type Result struct {
 	Symbols map[string][]store.SymbolRecord
 }
 
+// Prune dependency, metadata, cache, and generated-output trees before walking them.
+var defaultExcludedDirs = map[string]struct{}{
+	".angular":         {},
+	".cache":           {},
+	".codesitter":      {},
+	".git":             {},
+	".hg":              {},
+	".next":            {},
+	".nuxt":            {},
+	".parcel-cache":    {},
+	".pnpm":            {},
+	".svelte-kit":      {},
+	".svn":             {},
+	".turbo":           {},
+	".vite":            {},
+	".yarn":            {},
+	"bower_components": {},
+	"build":            {},
+	"coverage":         {},
+	"dist":             {},
+	"jspm_packages":    {},
+	"node_modules":     {},
+	"out":              {},
+	"target":           {},
+	"vendor":           {},
+}
+
 func Scan(opts Options) (Result, error) {
 	allowed := allowedExts(opts.Langs)
 	files := []store.FileRecord{}
@@ -38,8 +65,7 @@ func Scan(opts Options) (Result, error) {
 			return err
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if name == ".git" || name == "node_modules" || name == ".codesitter" {
+			if _, ok := defaultExcludedDirs[strings.ToLower(d.Name())]; ok {
 				return filepath.SkipDir
 			}
 			return nil

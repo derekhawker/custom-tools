@@ -31,7 +31,7 @@ export default tool({
     force: tool.schema.boolean().optional().describe("Allow indexing to run. Required by codesitter for index action."),
     lang: tool.schema.string().optional().describe("Comma-separated language filters for indexing, for example: js,ts,tsx"),
     include: tool.schema.string().optional().describe("Include glob for indexing"),
-    exclude: tool.schema.string().optional().describe("Exclude glob for indexing"),
+    exclude: tool.schema.string().optional().describe("Additional exclude glob for indexing; common dependency and build directories are skipped by default."),
     maxFiles: tool.schema.number().int().positive().optional().describe("Maximum files to index"),
     intent: tool.schema.enum(intents).optional().describe("Query intent. Required for query action."),
     symbol: tool.schema.string().optional().describe("Symbol name for symbol-based query intents"),
