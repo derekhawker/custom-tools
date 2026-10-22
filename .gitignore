@@ -1,5 +1,5 @@
 node_modules/
 *.log
 .DS_Store
-.codesitter
-.node_modules
+.codesitter/
+node_modules/
