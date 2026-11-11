@@ -23,7 +23,7 @@ func TestStoreIndexLifecycle(t *testing.T) {
 		t.Fatalf("expected no index")
 	}
 
-	if err := RecordIndex(db, root, []string{"js", "ts"}, "incremental", IndexStats{}); err != nil {
+	if err := RecordIndex(db, root, []string{"javascript", "typescript"}, []string{"javascript", "typescript", "tsx"}, "full", IndexStats{}); err != nil {
 		t.Fatalf("record index: %v", err)
 	}
 
@@ -39,11 +39,11 @@ func TestStoreIndexLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get summary: %v", err)
 	}
-	if summary.Version != "1" {
-		t.Fatalf("expected version 1, got %q", summary.Version)
+	if summary.Version != CurrentIndexVersion {
+		t.Fatalf("expected current version %q, got %q", CurrentIndexVersion, summary.Version)
 	}
-	if len(summary.LanguageSet) != 2 {
-		t.Fatalf("expected 2 languages, got %d", len(summary.LanguageSet))
+	if len(summary.LanguageSet) != 2 || len(summary.LanguageScope) != 3 {
+		t.Fatalf("expected detected languages and selected scope, got %#v", summary)
 	}
 }
 

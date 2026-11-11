@@ -2,9 +2,11 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
@@ -26,14 +28,19 @@ var stylesheetFunctionRE = regexp.MustCompile(`^[\t ]*@function[\t ]+([-_a-zA-Z]
 type Options struct {
 	RootPath string
 	Langs    []string
-	Include  string
-	Exclude  string
-	MaxFiles int
+	Paths    []string
+	Targeted bool
+	Previous map[string]store.FileRecord
 }
 
 type Result struct {
-	Files   []store.FileRecord
-	Symbols map[string][]store.SymbolRecord
+	Files                 []store.FileRecord
+	Symbols               map[string][]store.SymbolRecord
+	Calls                 []store.CallRecord
+	ChangedPaths          []string
+	FilesScanned          int
+	SkippedDirectories    []string
+	SkippedDirectoryCount int
 }
 
 // Prune dependency, metadata, cache, and generated-output trees before walking them.
@@ -64,59 +71,242 @@ var defaultExcludedDirs = map[string]struct{}{
 }
 
 func Scan(opts Options) (Result, error) {
+	if err := ValidateLanguages(opts.Langs); err != nil {
+		return Result{}, err
+	}
 	allowed := allowedExts(opts.Langs)
-	files := []store.FileRecord{}
-	symbols := map[string][]store.SymbolRecord{}
+	result := Result{Files: []store.FileRecord{}, Symbols: map[string][]store.SymbolRecord{}}
+	process := func(path, rel string, requireLanguage bool) error {
+		ext := strings.ToLower(filepath.Ext(path))
+		lang, ok := extToLanguage(ext)
+		if !ok {
+			if requireLanguage {
+				return fmt.Errorf("unsupported source file %q", rel)
+			}
+			return nil
+		}
+		if len(allowed) > 0 {
+			if _, ok := allowed[ext]; !ok {
+				if requireLanguage {
+					return fmt.Errorf("file %q is not among selected languages", rel)
+				}
+				return nil
+			}
+		}
+		hash, mtime, size, err := store.HashFile(path)
+		if err != nil {
+			return err
+		}
+		record := store.FileRecord{RelPath: rel, Language: lang, ContentHash: hash, MtimeNS: mtime, SizeBytes: size}
+		result.Files = append(result.Files, record)
+		result.FilesScanned++
+		previous, hadPrevious := opts.Previous[rel]
+		changed := !hadPrevious || previous.ContentHash != hash || previous.Language != lang
+		if changed {
+			result.ChangedPaths = append(result.ChangedPaths, rel)
+			syms, fileCalls, source, parseErr := extractFile(path, rel, lang)
+			if parseErr != nil {
+				return parseErr
+			}
+			record.Snapshot = source
+			result.Files[len(result.Files)-1] = record
+			result.Symbols[rel] = syms
+			result.Calls = append(result.Calls, fileCalls...)
+		}
+		return nil
+	}
+
+	if opts.Targeted {
+		seen := map[string]struct{}{}
+		for _, path := range opts.Paths {
+			clean := filepath.Clean(filepath.FromSlash(path))
+			if filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+				return Result{}, fmt.Errorf("targeted path must be relative to project root: %q", path)
+			}
+			rel := filepath.ToSlash(clean)
+			if _, duplicate := seen[rel]; duplicate {
+				continue
+			}
+			seen[rel] = struct{}{}
+			full := filepath.Join(opts.RootPath, clean)
+			st, err := os.Lstat(full)
+			if err != nil {
+				return Result{}, fmt.Errorf("changed path %q: %w (use deleted-path input for removals)", rel, err)
+			}
+			if !st.Mode().IsRegular() {
+				return Result{}, fmt.Errorf("changed path %q is not a regular file", rel)
+			}
+			rootResolved, err := filepath.EvalSymlinks(opts.RootPath)
+			if err != nil {
+				return Result{}, err
+			}
+			fileResolved, err := filepath.EvalSymlinks(full)
+			if err != nil {
+				return Result{}, err
+			}
+			withinRoot, err := filepath.Rel(rootResolved, fileResolved)
+			if err != nil || withinRoot == ".." || strings.HasPrefix(withinRoot, ".."+string(filepath.Separator)) {
+				return Result{}, fmt.Errorf("changed path %q resolves outside project root", rel)
+			}
+			if err := process(full, rel, true); err != nil {
+				return Result{}, err
+			}
+		}
+		return result, nil
+	}
+
 	err := filepath.WalkDir(opts.RootPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
 			if _, ok := defaultExcludedDirs[strings.ToLower(d.Name())]; ok {
+				rel, relErr := filepath.Rel(opts.RootPath, path)
+				if relErr != nil {
+					return relErr
+				}
+				result.SkippedDirectoryCount++
+				if len(result.SkippedDirectories) < 20 {
+					result.SkippedDirectories = append(result.SkippedDirectories, filepath.ToSlash(rel))
+				}
 				return filepath.SkipDir
 			}
 			return nil
 		}
-
-		ext := strings.ToLower(filepath.Ext(path))
-		lang, ok := extToLanguage(ext)
-		if !ok {
+		if d.Type()&os.ModeSymlink != 0 {
 			return nil
-		}
-		if len(allowed) > 0 {
-			if _, ok := allowed[ext]; !ok {
-				return nil
-			}
 		}
 		rel, err := filepath.Rel(opts.RootPath, path)
 		if err != nil {
 			return err
 		}
-		rel = filepath.ToSlash(rel)
-		if !matchesGlob(opts.Include, rel, true) || matchesGlob(opts.Exclude, rel, false) {
-			return nil
-		}
-
-		hash, mtime, size, err := store.HashFile(path)
-		if err != nil {
-			return err
-		}
-		files = append(files, store.FileRecord{RelPath: rel, Language: lang, ContentHash: hash, MtimeNS: mtime, SizeBytes: size})
-		syms, exErr := extractSymbols(path, rel, lang)
-		if exErr != nil {
-			return exErr
-		}
-		symbols[rel] = syms
-
-		if opts.MaxFiles > 0 && len(files) >= opts.MaxFiles {
-			return filepath.SkipAll
-		}
-		return nil
+		return process(path, filepath.ToSlash(rel), false)
 	})
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Files: files, Symbols: symbols}, nil
+	return result, nil
+}
+
+func ValidateLanguages(langs []string) error {
+	for _, lang := range langs {
+		switch strings.ToLower(strings.TrimSpace(lang)) {
+		case "javascript", "js", "typescript", "ts", "tsx", "go", "golang", "java", "rust", "rs", "css", "scss", "sass":
+		default:
+			return fmt.Errorf("unsupported language %q; supported languages: js, ts, tsx, go, java, rust, css, scss, sass", lang)
+		}
+	}
+	return nil
+}
+
+func LanguageNames(langs []string) []string {
+	if len(langs) == 0 {
+		return []string{"css", "go", "java", "javascript", "rust", "sass", "scss", "tsx", "typescript"}
+	}
+	names := map[string]struct{}{}
+	for _, language := range langs {
+		switch strings.ToLower(strings.TrimSpace(language)) {
+		case "javascript", "js":
+			names["javascript"] = struct{}{}
+		case "typescript", "ts":
+			names["typescript"] = struct{}{}
+		case "tsx":
+			names["tsx"] = struct{}{}
+		case "go", "golang":
+			names["go"] = struct{}{}
+		case "java":
+			names["java"] = struct{}{}
+		case "rust", "rs":
+			names["rust"] = struct{}{}
+		case "css":
+			names["css"] = struct{}{}
+		case "scss":
+			names["scss"] = struct{}{}
+		case "sass":
+			names["sass"] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(names))
+	for name := range names {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func extractFile(path, relPath, lang string) ([]store.SymbolRecord, []store.CallRecord, []byte, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	parser := sitter.NewParser()
+	defer parser.Close()
+	parser.SetLanguage(languageFor(lang))
+	tree, err := parser.ParseCtx(context.Background(), nil, src)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer tree.Close()
+	symbols := []store.SymbolRecord{}
+	walkSymbols(tree.RootNode(), src, relPath, lang, &symbols)
+	var calls []store.CallRecord
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node == nil {
+			return
+		}
+		if node.Type() == "call_expression" {
+			function := node.ChildByFieldName("function")
+			callee := lastIdentifier(nodeText(src, function))
+			if callee != "" {
+				callLine := int(node.StartPoint().Row) + 1
+				owner := enclosingSymbol(symbols, callLine)
+				if owner != nil {
+					snippet := strings.Join(strings.Fields(nodeText(src, node)), " ")
+					if runes := []rune(snippet); len(runes) > 240 {
+						snippet = string(runes[:237]) + "..."
+					}
+					calls = append(calls, store.CallRecord{
+						RelPath: relPath, CallerName: owner.Name,
+						CallerStartLine: owner.StartLine, CalleeName: callee,
+						CallSiteLine: callLine, CallSiteColumn: int(node.StartPoint().Column), Snippet: snippet,
+					})
+				}
+			}
+		}
+		for i := 0; i < int(node.NamedChildCount()); i++ {
+			walk(node.NamedChild(i))
+		}
+	}
+	walk(tree.RootNode())
+	return symbols, calls, src, nil
+}
+
+var identifierRE = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+func lastIdentifier(expression string) string {
+	identifiers := identifierRE.FindAllString(expression, -1)
+	if len(identifiers) == 0 {
+		return ""
+	}
+	return identifiers[len(identifiers)-1]
+}
+
+func enclosingSymbol(symbols []store.SymbolRecord, line int) *store.SymbolRecord {
+	var owner *store.SymbolRecord
+	ownerSpan := int(^uint(0) >> 1)
+	for i := range symbols {
+		symbol := &symbols[i]
+		if line < symbol.StartLine || line > symbol.EndLine {
+			continue
+		}
+		span := symbol.EndLine - symbol.StartLine
+		if span < ownerSpan {
+			owner = symbol
+			ownerSpan = span
+		}
+	}
+	return owner
 }
 
 func allowedExts(langs []string) map[string]struct{} {
@@ -174,24 +364,6 @@ func extToLanguage(ext string) (string, bool) {
 	default:
 		return "", false
 	}
-}
-
-func extractSymbols(path, relPath, lang string) ([]store.SymbolRecord, error) {
-	src, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	parser := sitter.NewParser()
-	parser.SetLanguage(languageFor(lang))
-	tree, err := parser.ParseCtx(context.Background(), nil, src)
-	if err != nil {
-		return nil, err
-	}
-
-	out := []store.SymbolRecord{}
-	walkSymbols(tree.RootNode(), src, relPath, lang, &out)
-	return out, nil
 }
 
 func languageFor(lang string) *sitter.Language {
@@ -505,9 +677,29 @@ func addSymbol(out *[]store.SymbolRecord, relPath, lang, name, kind string, n *s
 		Kind:      kind,
 		StartLine: start,
 		EndLine:   end,
-		Signature: strings.TrimSpace(nodeText(src, n)),
+		Signature: declarationHeader(src, n),
 		Language:  lang,
 	})
+}
+
+func declarationHeader(src []byte, n *sitter.Node) string {
+	if n == nil {
+		return ""
+	}
+	start, end := n.StartByte(), n.EndByte()
+	if body := n.ChildByFieldName("body"); body != nil && body.StartByte() >= start {
+		end = body.StartByte()
+	} else if newline := strings.IndexByte(string(src[start:end]), '\n'); newline >= 0 {
+		end = start + uint32(newline)
+	}
+	header := strings.TrimSpace(string(src[start:end]))
+	header = strings.TrimSpace(strings.TrimSuffix(header, "{"))
+	const maxHeaderRunes = 320
+	runes := []rune(header)
+	if len(runes) > maxHeaderRunes {
+		header = string(runes[:maxHeaderRunes-3]) + "..."
+	}
+	return header
 }
 
 func nodeText(src []byte, n *sitter.Node) string {
