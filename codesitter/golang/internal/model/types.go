@@ -15,18 +15,24 @@ type ErrDetail struct {
 
 type IndexResponse struct {
 	Envelope
-	Started       bool       `json:"started"`
-	RequiresForce bool       `json:"requires_force"`
-	Mode          string     `json:"mode,omitempty"`
+	Started       bool        `json:"started"`
+	RequiresForce bool        `json:"requires_force"`
+	Usable        bool        `json:"usable"`
+	LanguageSet   []string    `json:"language_set"`
+	LanguageScope []string    `json:"language_scope"`
+	Coverage      string      `json:"coverage"`
+	Mode          string      `json:"mode,omitempty"`
 	Stats         *IndexStats `json:"stats,omitempty"`
 }
 
 type IndexStats struct {
-	FilesScanned     int   `json:"files_scanned"`
-	FilesIndexed     int   `json:"files_indexed"`
-	SymbolsWritten   int   `json:"symbols_written"`
-	RelationsWritten int   `json:"relations_written"`
-	DurationMS       int64 `json:"duration_ms"`
+	FilesScanned          int      `json:"files_scanned"`
+	FilesChanged          int      `json:"files_changed"`
+	FilesParsed           int      `json:"files_parsed"`
+	FilesDeleted          int      `json:"files_deleted"`
+	DurationMS            int64    `json:"duration_ms"`
+	SkippedDirectoryCount int      `json:"skipped_directory_count,omitempty"`
+	SkippedDirectories    []string `json:"skipped_directories,omitempty"`
 }
 
 type StatusResponse struct {
@@ -37,19 +43,27 @@ type StatusResponse struct {
 }
 
 type IndexMeta struct {
-	Version       string   `json:"version"`
-	CreatedAt     string   `json:"created_at"`
-	UpdatedAt     string   `json:"updated_at"`
-	LanguageSet   []string `json:"language_set"`
-	FileCount     int      `json:"file_count"`
-	SymbolCount   int      `json:"symbol_count"`
-	RelationCount int      `json:"relation_count"`
+	Version                string   `json:"version"`
+	CreatedAt              string   `json:"created_at"`
+	UpdatedAt              string   `json:"updated_at"`
+	LastFullReconciliation string   `json:"last_full_reconciliation,omitempty"`
+	LastTargetedUpdate     string   `json:"last_targeted_update,omitempty"`
+	LanguageSet            []string `json:"language_set"`
+	LanguageScope          []string `json:"language_scope"`
+	FileCount              int      `json:"file_count"`
+	SymbolCount            int      `json:"symbol_count"`
+	RelationCount          int      `json:"relation_count"`
+	Usable                 bool     `json:"usable"`
+	Coverage               string   `json:"coverage"`
 }
 
 type Freshness struct {
-	StaleFiles   int  `json:"stale_files"`
-	DeletedFiles int  `json:"deleted_files"`
-	NeedsReindex bool `json:"needs_reindex"`
+	StaleFiles   int      `json:"stale_files"`
+	DeletedFiles int      `json:"deleted_files"`
+	NewFiles     int      `json:"new_files"`
+	NeedsReindex bool     `json:"needs_reindex"`
+	CheckMethod  string   `json:"check_method"`
+	Limitations  []string `json:"limitations,omitempty"`
 }
 
 type QueryResponse struct {
@@ -60,22 +74,29 @@ type QueryResponse struct {
 }
 
 type QueryResult struct {
-	SymbolID  string  `json:"symbol_id"`
-	Name      string  `json:"name"`
-	Kind      string  `json:"kind"`
-	File      string  `json:"file"`
-	StartLine int     `json:"start_line"`
-	EndLine   int     `json:"end_line"`
-	Signature string  `json:"signature,omitempty"`
-	Snippet   string  `json:"snippet,omitempty"`
-	Score     float64 `json:"score"`
-	Relation  string  `json:"relation"`
-	Language  string  `json:"language"`
+	SymbolID       string `json:"symbol_id"`
+	Name           string `json:"name"`
+	Kind           string `json:"kind"`
+	File           string `json:"file"`
+	StartLine      int    `json:"start_line"`
+	EndLine        int    `json:"end_line"`
+	Signature      string `json:"signature,omitempty"`
+	Snippet        string `json:"snippet,omitempty"`
+	Relation       string `json:"relation"`
+	Language       string `json:"language"`
+	Caller         string `json:"caller,omitempty"`
+	Callee         string `json:"callee,omitempty"`
+	CallSiteLine   int    `json:"call_site_line,omitempty"`
+	CallSiteColumn int    `json:"call_site_column,omitempty"`
+	Resolution     string `json:"resolution,omitempty"`
+	Evidence       string `json:"evidence,omitempty"`
 }
 
 type QueryMeta struct {
-	Limit        int   `json:"limit"`
-	Returned     int   `json:"returned"`
-	IndexVersion string `json:"index_version"`
-	DurationMS   int64 `json:"duration_ms"`
+	Limit        int      `json:"limit"`
+	Returned     int      `json:"returned"`
+	IndexVersion string   `json:"index_version"`
+	DurationMS   int64    `json:"duration_ms"`
+	HasMore      bool     `json:"has_more"`
+	Warnings     []string `json:"warnings,omitempty"`
 }

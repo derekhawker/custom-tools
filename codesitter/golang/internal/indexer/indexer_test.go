@@ -3,7 +3,10 @@ package indexer
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/derekhawker/codesitter/internal/store"
 )
 
 func TestScanSkipsDependencyAndGeneratedDirectories(t *testing.T) {
@@ -77,6 +80,50 @@ func TestScanSupportsJavaScriptModuleExtensions(t *testing.T) {
 		if len(result.Symbols[file.RelPath]) != 1 || result.Symbols[file.RelPath][0].Name != wantSymbols[file.RelPath] {
 			t.Errorf("expected JavaScript symbol %q in %s, got %#v", wantSymbols[file.RelPath], file.RelPath, result.Symbols[file.RelPath])
 		}
+	}
+}
+
+func TestScanSkipsParsingUnchangedFiles(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "same.ts")
+	if err := os.WriteFile(path, []byte("export function same() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash, mtime, size, err := store.HashFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := Scan(Options{RootPath: root, Langs: []string{"ts"}, Previous: map[string]store.FileRecord{
+		"same.ts": {RelPath: "same.ts", Language: "typescript", ContentHash: hash, MtimeNS: mtime, SizeBytes: size},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesScanned != 1 || len(result.ChangedPaths) != 0 || len(result.Symbols) != 0 {
+		t.Fatalf("unchanged scan should retain coverage without reparsing, got %#v", result)
+	}
+}
+
+func TestScanTargetsOnlySuppliedPaths(t *testing.T) {
+	root := t.TempDir()
+	for name, source := range map[string]string{"a.ts": "function a() {}", "b.ts": "function b() {}"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(source), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := Scan(Options{RootPath: root, Langs: []string{"ts"}, Targeted: true, Paths: []string{"b.ts"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 1 || result.Files[0].RelPath != "b.ts" || result.FilesScanned != 1 {
+		t.Fatalf("targeted scan should only visit b.ts, got %#v", result)
+	}
+}
+
+func TestTargetedScanRejectsPathsOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	if _, err := Scan(Options{RootPath: root, Targeted: true, Paths: []string{"../outside.ts"}}); err == nil {
+		t.Fatal("expected path outside project root to be rejected")
 	}
 }
 
@@ -214,5 +261,37 @@ macro_rules! log_message {
 		if got[name] != kind {
 			t.Errorf("expected Rust symbol %q to have kind %q, got %q", name, kind, got[name])
 		}
+	}
+}
+
+func TestValidateLanguagesRejectsUnknownAndEmptyNames(t *testing.T) {
+	for _, langs := range [][]string{{"rustish"}, {"js", "unknown"}, {""}, {"js", " "}} {
+		if err := ValidateLanguages(langs); err == nil {
+			t.Errorf("expected invalid language list %#v to be rejected", langs)
+		}
+	}
+}
+
+func TestValidateLanguagesAcceptsSupportedAliases(t *testing.T) {
+	if err := ValidateLanguages([]string{"js", "typescript", "rust", "css", "sass"}); err != nil {
+		t.Fatalf("supported languages rejected: %v", err)
+	}
+}
+
+func TestDeclarationSignaturesOmitFunctionBodies(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.ts"), []byte("export function save(item: string) {\n  persist(item)\n  return item\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Scan(Options{RootPath: root, Langs: []string{"ts"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Symbols["a.ts"]) != 1 {
+		t.Fatalf("expected one declaration, got %#v", result.Symbols["a.ts"])
+	}
+	header := result.Symbols["a.ts"][0].Signature
+	if strings.Contains(header, "persist") || strings.Contains(header, "return item") || !strings.Contains(header, "save(item: string)") {
+		t.Fatalf("expected bounded declaration header without body, got %q", header)
 	}
 }
