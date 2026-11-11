@@ -34,6 +34,7 @@ type Options struct {
 type Result struct {
 	Files   []store.FileRecord
 	Symbols map[string][]store.SymbolRecord
+	Calls   []store.CallRecord
 }
 
 // Prune dependency, metadata, cache, and generated-output trees before walking them.
@@ -67,6 +68,7 @@ func Scan(opts Options) (Result, error) {
 	allowed := allowedExts(opts.Langs)
 	files := []store.FileRecord{}
 	symbols := map[string][]store.SymbolRecord{}
+	calls := []store.CallRecord{}
 	err := filepath.WalkDir(opts.RootPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -107,6 +109,11 @@ func Scan(opts Options) (Result, error) {
 			return exErr
 		}
 		symbols[rel] = syms
+		fileCalls, callErr := extractCalls(path, rel, lang, syms)
+		if callErr != nil {
+			return callErr
+		}
+		calls = append(calls, fileCalls...)
 
 		if opts.MaxFiles > 0 && len(files) >= opts.MaxFiles {
 			return filepath.SkipAll
@@ -116,7 +123,73 @@ func Scan(opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Files: files, Symbols: symbols}, nil
+	return Result{Files: files, Symbols: symbols, Calls: calls}, nil
+}
+
+func extractCalls(path, relPath, lang string, symbols []store.SymbolRecord) ([]store.CallRecord, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	parser := sitter.NewParser()
+	parser.SetLanguage(languageFor(lang))
+	tree, err := parser.ParseCtx(context.Background(), nil, src)
+	if err != nil {
+		return nil, err
+	}
+	var calls []store.CallRecord
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node == nil {
+			return
+		}
+		if node.Type() == "call_expression" {
+			function := node.ChildByFieldName("function")
+			callee := lastIdentifier(nodeText(src, function))
+			if callee != "" {
+				line := int(node.StartPoint().Row) + 1
+				owner := enclosingSymbol(symbols, line)
+				if owner != nil {
+					calls = append(calls, store.CallRecord{
+						RelPath: relPath, CallerName: owner.Name,
+						CallerStartLine: owner.StartLine, CalleeName: callee,
+					})
+				}
+			}
+		}
+		for i := 0; i < int(node.NamedChildCount()); i++ {
+			walk(node.NamedChild(i))
+		}
+	}
+	walk(tree.RootNode())
+	return calls, nil
+}
+
+var identifierRE = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+func lastIdentifier(expression string) string {
+	identifiers := identifierRE.FindAllString(expression, -1)
+	if len(identifiers) == 0 {
+		return ""
+	}
+	return identifiers[len(identifiers)-1]
+}
+
+func enclosingSymbol(symbols []store.SymbolRecord, line int) *store.SymbolRecord {
+	var owner *store.SymbolRecord
+	ownerSpan := int(^uint(0) >> 1)
+	for i := range symbols {
+		symbol := &symbols[i]
+		if line < symbol.StartLine || line > symbol.EndLine {
+			continue
+		}
+		span := symbol.EndLine - symbol.StartLine
+		if span < ownerSpan {
+			owner = symbol
+			ownerSpan = span
+		}
+	}
+	return owner
 }
 
 func allowedExts(langs []string) map[string]struct{} {

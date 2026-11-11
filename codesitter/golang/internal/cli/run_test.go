@@ -125,6 +125,60 @@ func TestIndexStatusQueryFlow(t *testing.T) {
 	}
 }
 
+func TestCallQueriesReturnEnclosingFunctionsOnly(t *testing.T) {
+	root := t.TempDir()
+	source := `function target() {}
+function firstCaller() {
+  target()
+}
+function secondCaller() {
+  target()
+}
+function unrelated() {
+  other()
+  // target()
+  const example = "target()"
+}
+function other() {}
+`
+	if err := os.WriteFile(filepath.Join(root, "calls.ts"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"index", "--path", root, "--force", "--lang", "ts", "--json"}, &out, &errOut); code != ExitOK {
+		t.Fatalf("index expected code %d, got %d, stderr=%s", ExitOK, code, errOut.String())
+	}
+
+	query := func(intent, symbol string) model.QueryResponse {
+		t.Helper()
+		out.Reset()
+		errOut.Reset()
+		if code := Run([]string{"query", intent, "--path", root, "--symbol", symbol, "--json"}, &out, &errOut); code != ExitOK {
+			t.Fatalf("%s %s expected code %d, got %d, stderr=%s", intent, symbol, ExitOK, code, errOut.String())
+		}
+		var response model.QueryResponse
+		if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+			t.Fatalf("decode %s response: %v", intent, err)
+		}
+		return response
+	}
+
+	callers := query("find_callers", "target")
+	gotCallers := map[string]bool{}
+	for _, result := range callers.Results {
+		gotCallers[result.Name] = true
+	}
+	if len(gotCallers) != 2 || !gotCallers["firstCaller"] || !gotCallers["secondCaller"] {
+		t.Fatalf("expected only firstCaller and secondCaller, got %#v", callers.Results)
+	}
+
+	callees := query("find_callees", "firstCaller")
+	if len(callees.Results) != 1 || callees.Results[0].Name != "target" {
+		t.Fatalf("expected firstCaller to call only target, got %#v", callees.Results)
+	}
+}
+
 func TestIndexGoDeclarations(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\ntype Server struct{}\n\nfunc Run() {}\n\nfunc (s Server) Start() {}\n"), 0o644); err != nil {

@@ -134,7 +134,7 @@ func runIndex(args []string, stdout, stderr io.Writer) int {
 			return ExitError
 		}
 	}
-	if err := store.RecomputeRelations(db, absPath); err != nil {
+	if err := store.RecomputeRelations(db, absPath, scanResult.Calls); err != nil {
 		writeErr(stderr, err.Error())
 		return ExitError
 	}

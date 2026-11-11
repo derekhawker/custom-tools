@@ -46,9 +46,15 @@ type SymbolRecord struct {
 	Language  string
 }
 
+type CallRecord struct {
+	RelPath         string
+	CallerName      string
+	CallerStartLine int
+	CalleeName      string
+}
+
 var importRE = regexp.MustCompile(`^\s*import\s+.*?from\s+['\"]([^'\"]+)['\"]|^\s*import\s+['\"]([^'\"]+)['\"]`)
 var rustUseRE = regexp.MustCompile(`^\s*(pub(\([^)]*\))?\s+)?use\s+([^;]+);`)
-var callRE = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*!?\s*\(`)
 
 var rustUseStartRE = regexp.MustCompile(`^\s*(pub(\([^)]*\))?\s+)?use\b`)
 
@@ -409,28 +415,25 @@ func LanguageSetFromFiles(files []FileRecord) []string {
 	return out
 }
 
-func RecomputeRelations(db *sql.DB, projectPath string) error {
+func RecomputeRelations(db *sql.DB, projectPath string, calls []CallRecord) error {
 	if _, err := db.Exec(`DELETE FROM relations WHERE root_path=?`, projectPath); err != nil {
 		return err
 	}
 
-	fileIDs := map[string]int64{}
-	rows, err := db.Query(`SELECT id, rel_path FROM files WHERE root_path=?`, projectPath)
+	rows, err := db.Query(`SELECT rel_path FROM files WHERE root_path=?`, projectPath)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var id int64
 		var rel string
-		if err := rows.Scan(&id, &rel); err != nil {
+		if err := rows.Scan(&rel); err != nil {
 			rows.Close()
 			return err
 		}
-		fileIDs[rel] = id
 	}
 	rows.Close()
 
-	targetByName := map[string]int64{}
+	targetByName := map[string][]int64{}
 	rows, err = db.Query(`SELECT id, name FROM symbols WHERE root_path=?`, projectPath)
 	if err != nil {
 		return err
@@ -442,9 +445,7 @@ func RecomputeRelations(db *sql.DB, projectPath string) error {
 			rows.Close()
 			return err
 		}
-		if _, ok := targetByName[name]; !ok {
-			targetByName[name] = id
-		}
+		targetByName[name] = append(targetByName[name], id)
 	}
 	rows.Close()
 
@@ -466,22 +467,6 @@ func RecomputeRelations(db *sql.DB, projectPath string) error {
 			for _, mod := range importedModules(line) {
 				_, _ = db.Exec(`INSERT INTO relations(root_path, from_symbol_id, to_symbol_id, type) VALUES (?, NULL, NULL, ?)`, projectPath, "imports:"+mod)
 			}
-			for _, cm := range callRE.FindAllStringSubmatch(line, -1) {
-				if len(cm) < 2 {
-					continue
-				}
-				called := cm[1]
-				toID, ok := targetByName[called]
-				if !ok {
-					continue
-				}
-				fromID := int64(0)
-				_ = db.QueryRow(`SELECT id FROM symbols WHERE root_path=? AND file_id=? ORDER BY start_line LIMIT 1`, projectPath, fileIDs[f.RelPath]).Scan(&fromID)
-				if fromID == 0 {
-					continue
-				}
-				_, _ = db.Exec(`INSERT INTO relations(root_path, from_symbol_id, to_symbol_id, type) VALUES (?, ?, ?, 'calls')`, projectPath, fromID, toID)
-			}
 		}
 		if f.Language == "rust" {
 			for _, use := range rustUseStatements(sourceText) {
@@ -490,13 +475,33 @@ func RecomputeRelations(db *sql.DB, projectPath string) error {
 		}
 		_ = s.Err()
 	}
+	seenCalls := make(map[[2]int64]struct{}, len(calls))
+	for _, call := range calls {
+		var fromID int64
+		if err := db.QueryRow(`
+SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id
+WHERE s.root_path=? AND f.rel_path=? AND s.name=? AND s.start_line=?
+LIMIT 1`, projectPath, call.RelPath, call.CallerName, call.CallerStartLine).Scan(&fromID); err != nil {
+			continue
+		}
+		for _, toID := range targetByName[call.CalleeName] {
+			edge := [2]int64{fromID, toID}
+			if _, exists := seenCalls[edge]; exists {
+				continue
+			}
+			seenCalls[edge] = struct{}{}
+			if _, err := db.Exec(`INSERT INTO relations(root_path, from_symbol_id, to_symbol_id, type) VALUES (?, ?, ?, 'calls')`, projectPath, fromID, toID); err != nil {
+				return err
+			}
+		}
+	}
 
 	return nil
 }
 
 func FindCallers(db *sql.DB, projectPath, symbol string, limit int) ([]SymbolRecord, error) {
 	rows, err := db.Query(`
-SELECT sf.rel_path, ss.name, ss.kind, ss.start_line, ss.end_line, ss.signature, sf.language
+SELECT DISTINCT sf.rel_path, ss.name, ss.kind, ss.start_line, ss.end_line, ss.signature, sf.language
 FROM relations r
 JOIN symbols ss ON ss.id = r.from_symbol_id
 JOIN files sf ON sf.id = ss.file_id
@@ -521,7 +526,7 @@ LIMIT ?
 
 func FindCallees(db *sql.DB, projectPath, symbol string, limit int) ([]SymbolRecord, error) {
 	rows, err := db.Query(`
-SELECT tf.rel_path, ts.name, ts.kind, ts.start_line, ts.end_line, ts.signature, tf.language
+SELECT DISTINCT tf.rel_path, ts.name, ts.kind, ts.start_line, ts.end_line, ts.signature, tf.language
 FROM relations r
 JOIN symbols ss ON ss.id = r.from_symbol_id
 JOIN symbols ts ON ts.id = r.to_symbol_id
