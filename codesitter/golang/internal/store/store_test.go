@@ -1,9 +1,13 @@
 package store
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestStoreIndexLifecycle(t *testing.T) {
@@ -122,6 +126,144 @@ func TestLockAcquireRelease(t *testing.T) {
 	}
 	if err := lock.Release(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAcquireLockRecoversDeadOwner(t *testing.T) {
+	root := t.TempDir()
+	lockPath := LockPath(root)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(lockOwner{PID: 1 << 30, Host: hostnameOrEmpty(), ProcessBorn: "1", Token: "stale", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := AcquireLock(root)
+	if err != nil {
+		t.Fatalf("expected stale lock recovery: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAcquireLockPreservesLegacyLock(t *testing.T) {
+	root := t.TempDir()
+	lockPath := LockPath(root)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, []byte(time.Now().Add(-24*time.Hour).Format(time.RFC3339Nano)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireLock(root); err != ErrLocked {
+		t.Fatalf("expected ambiguous legacy lock to remain locked, got %v", err)
+	}
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("legacy lock was unexpectedly removed: %v", err)
+	}
+}
+
+func TestConcurrentStaleLockRecoveryHasOneWinner(t *testing.T) {
+	root := t.TempDir()
+	lockPath := LockPath(root)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(lockOwner{PID: 1 << 30, Host: hostnameOrEmpty(), ProcessBorn: "1", Token: "stale", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wins := make(chan *Lock, 8)
+	errs := make(chan error, 8)
+	for i := 0; i < cap(wins); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lock, err := AcquireLock(root)
+			if err != nil {
+				errs <- err
+				return
+			}
+			wins <- lock
+		}()
+	}
+	wg.Wait()
+	close(wins)
+	close(errs)
+	var acquired []*Lock
+	for lock := range wins {
+		acquired = append(acquired, lock)
+	}
+	if len(acquired) != 1 {
+		t.Fatalf("expected exactly one recovery winner, got %d", len(acquired))
+	}
+	for err := range errs {
+		if err != ErrLocked {
+			t.Errorf("expected ErrLocked for losing acquirer, got %v", err)
+		}
+	}
+	if err := acquired[0].Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFindSyntaxImporters(t *testing.T) {
+	tests := []struct {
+		name, lang, source, module string
+		want                       int
+	}{
+		{
+			name: "multiline typescript import and re-export", lang: "typescript",
+			source: "import {\n  value,\n} from \"@scope/pkg\";\nexport { other } from \"@scope/pkg\";",
+			module: "@scope/pkg", want: 2,
+		},
+		{
+			name: "ignores comments strings and identifier substrings", lang: "javascript",
+			source: "// import 'target'\nconst text = \"import target\";\nimport 'target-extra';",
+			module: "target", want: 0,
+		},
+		{
+			name: "multiple go imports", lang: "go",
+			source: "package p\nimport (\n \"fmt\"\n x \"example/x\"\n)",
+			module: "example/x", want: 1,
+		},
+		{
+			name: "java qualified import", lang: "java",
+			source: "import com.example.Service;", module: "com.example.Service", want: 1,
+		},
+		{
+			name: "rust grouped use", lang: "rust",
+			source: "use service::{Service, Other};", module: "service::Service", want: 1,
+		},
+		{
+			name: "css import", lang: "css",
+			source: "@import\n  url(\"theme.css\");", module: "theme.css", want: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := findSyntaxImporters("sample."+tt.lang, tt.lang, []byte(tt.source), tt.module)
+			if err != nil {
+				t.Fatalf("findSyntaxImporters: %v", err)
+			}
+			if len(got) != tt.want {
+				t.Fatalf("got %d matches, want %d: %#v", len(got), tt.want, got)
+			}
+			for _, result := range got {
+				if !strings.Contains(result.Evidence, "syntax-aware") {
+					t.Errorf("expected syntax-aware evidence, got %q", result.Evidence)
+				}
+			}
+		})
 	}
 }
 
