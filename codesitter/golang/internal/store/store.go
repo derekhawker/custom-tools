@@ -2,18 +2,33 @@ package store
 
 import (
 	"bufio"
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	sitter "github.com/smacker/go-tree-sitter"
+	csslang "github.com/smacker/go-tree-sitter/css"
+	golang "github.com/smacker/go-tree-sitter/golang"
+	"github.com/smacker/go-tree-sitter/java"
+	"github.com/smacker/go-tree-sitter/javascript"
+	rustlang "github.com/smacker/go-tree-sitter/rust"
+	tsxlang "github.com/smacker/go-tree-sitter/typescript/tsx"
+	tslang "github.com/smacker/go-tree-sitter/typescript/typescript"
 
 	_ "modernc.org/sqlite"
 )
@@ -33,7 +48,16 @@ var ErrNotIndexed = errors.New("project not indexed")
 var ErrLocked = errors.New("index already running")
 
 type Lock struct {
-	path string
+	path  string
+	token string
+}
+
+type lockOwner struct {
+	PID         int    `json:"pid"`
+	Host        string `json:"host"`
+	ProcessBorn string `json:"process_born"`
+	Token       string `json:"token"`
+	CreatedAt   string `json:"created_at"`
 }
 
 type FileRecord struct {
@@ -127,26 +151,177 @@ func AcquireLock(projectPath string) (*Lock, error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
+	if lock, err := createOwnedLock(lockPath); err == nil {
+		return lock, nil
+	} else if !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	if lock, recovered, err := recoverStaleLock(lockPath); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return nil, ErrLocked
 		}
 		return nil, err
+	} else if recovered {
+		return lock, nil
 	}
-	_, _ = f.WriteString(time.Now().UTC().Format(time.RFC3339Nano))
-	_ = f.Close()
-	return &Lock{path: lockPath}, nil
+	return nil, ErrLocked
 }
 
 func (l *Lock) Release() error {
 	if l == nil || l.path == "" {
 		return nil
 	}
+	contents, err := os.ReadFile(l.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var owner lockOwner
+	if json.Unmarshal(contents, &owner) != nil || owner.Token != l.token {
+		return fmt.Errorf("index lock ownership changed before release")
+	}
 	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+func createOwnedLock(lockPath string) (*Lock, error) {
+	host, err := os.Hostname()
+	if err != nil {
+		return nil, err
+	}
+	birth, err := processBirth(os.Getpid())
+	if err != nil {
+		return nil, err
+	}
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return nil, err
+	}
+	owner := lockOwner{PID: os.Getpid(), Host: host, ProcessBorn: birth, Token: hex.EncodeToString(tokenBytes), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	data, err := json.Marshal(owner)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.CreateTemp(filepath.Dir(lockPath), ".index-lock-*")
+	if err != nil {
+		return nil, err
+	}
+	tempPath := f.Name()
+	defer os.Remove(tempPath)
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	// Publish only a complete owner record; linking fails atomically if another
+	// process already owns the lock path.
+	if err := os.Link(tempPath, lockPath); err != nil {
+		return nil, err
+	}
+	return &Lock{path: lockPath, token: owner.Token}, nil
+}
+
+func recoverStaleLock(lockPath string) (*Lock, bool, error) {
+	gate, err := os.OpenFile(lockPath+".recovery", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, false, err
+	}
+	defer gate.Close()
+	if err := syscall.Flock(int(gate.Fd()), syscall.LOCK_EX); err != nil {
+		return nil, false, err
+	}
+	defer syscall.Flock(int(gate.Fd()), syscall.LOCK_UN)
+
+	contents, err := os.ReadFile(lockPath)
+	if errors.Is(err, os.ErrNotExist) {
+		lock, createErr := createOwnedLock(lockPath)
+		return lock, createErr == nil, createErr
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var owner lockOwner
+	if err := json.Unmarshal(contents, &owner); err != nil || owner.PID <= 0 || owner.Token == "" || owner.Host == "" {
+		// Legacy timestamp-only locks have no owner identity; age cannot prove
+		// that their owner is gone, so leave them untouched.
+		return nil, false, nil
+	}
+	if owner.Host != hostnameOrEmpty() || processIsSame(owner.PID, owner.ProcessBorn) {
+		return nil, false, nil
+	}
+	// Hold the recovery gate while replacing the stale lock so only one
+	// recoverer can proceed. A normal acquirer can still win the atomic link
+	// race; in that case createOwnedLock returns os.ErrExist and nobody steals it.
+	if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
+	}
+	lock, err := createOwnedLock(lockPath)
+	return lock, err == nil, err
+}
+
+func hostnameOrEmpty() string {
+	host, _ := os.Hostname()
+	return host
+}
+
+func processIsSame(pid int, expectedBirth string) bool {
+	if pid <= 0 || expectedBirth == "" {
+		return true // Unknown identity is treated conservatively as alive.
+	}
+	if runtime.GOOS == "linux" {
+		birth, err := processBirth(pid)
+		if errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		if err != nil {
+			return true
+		}
+		return birth == expectedBirth
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if err := process.Signal(syscall.Signal(0)); err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			return true
+		}
+		if !errors.Is(err, os.ErrProcessDone) {
+			return false
+		}
+		return false
+	}
+	return true
+}
+
+func processBirth(pid int) (string, error) {
+	if runtime.GOOS != "linux" {
+		return "pid-only", nil
+	}
+	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return "", err
+	}
+	// comm is parenthesized and may contain spaces; starttime is field 22.
+	closeComm := strings.LastIndexByte(string(stat), ')')
+	if closeComm < 0 {
+		return "", fmt.Errorf("malformed process stat for pid %d", pid)
+	}
+	fields := strings.Fields(string(stat[closeComm+1:]))
+	if len(fields) <= 19 {
+		return "", fmt.Errorf("malformed process stat for pid %d", pid)
+	}
+	return fields[19], nil
 }
 
 func Open(projectPath string) (*sql.DB, error) {
@@ -779,6 +954,9 @@ LIMIT ?
 }
 
 func FindImporters(db *sql.DB, projectPath, module string, limit int) ([]SymbolRecord, error) {
+	if module == "" || limit <= 0 {
+		return []SymbolRecord{}, nil
+	}
 	files, err := GetIndexedFiles(db, projectPath)
 	if err != nil {
 		return nil, err
@@ -789,20 +967,9 @@ func FindImporters(db *sql.DB, projectPath, module string, limit int) ([]SymbolR
 		if err != nil {
 			return nil, err
 		}
-		lines := strings.Split(string(b), "\n")
-		fileResults := []SymbolRecord{}
-		for i, line := range lines {
-			if !strings.Contains(line, module) || !strings.Contains(line, "import") {
-				continue
-			}
-			fileResults = append(fileResults, SymbolRecord{RelPath: f.RelPath, Name: module, Kind: "text_match", StartLine: i + 1, EndLine: i + 1, Signature: boundedText(line), Language: f.Language, Evidence: "same-line text match; import syntax is not structurally resolved"})
-		}
-		if f.Language == "rust" {
-			for _, use := range rustUseStatements(string(b)) {
-				if strings.Contains(use.Module, module) {
-					fileResults = append(fileResults, SymbolRecord{RelPath: f.RelPath, Name: module, Kind: "import", StartLine: use.StartLine, EndLine: use.StartLine, Signature: boundedText(use.Signature), Language: f.Language, Evidence: "Rust use-statement text match; module resolution is not verified"})
-				}
-			}
+		fileResults, err := findSyntaxImporters(f.RelPath, f.Language, b, module)
+		if err != nil {
+			return nil, err
 		}
 		sort.SliceStable(fileResults, func(i, j int) bool {
 			return fileResults[i].StartLine < fileResults[j].StartLine
@@ -815,6 +982,132 @@ func FindImporters(db *sql.DB, projectPath, module string, limit int) ([]SymbolR
 		}
 	}
 	return out, nil
+}
+
+func findSyntaxImporters(relPath, lang string, source []byte, module string) ([]SymbolRecord, error) {
+	language, ok := importerLanguage(lang)
+	if !ok {
+		return nil, nil
+	}
+	parser := sitter.NewParser()
+	defer parser.Close()
+	parser.SetLanguage(language)
+	tree, err := parser.ParseCtx(context.Background(), nil, source)
+	if err != nil {
+		return nil, err
+	}
+	defer tree.Close()
+
+	matches := []SymbolRecord{}
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node == nil {
+			return
+		}
+		if isImporterNode(lang, node.Type()) {
+			text := string(source[node.StartByte():node.EndByte()])
+			path := importerPath(node, source, lang)
+			if importPathMatches(path, module) {
+				line := int(node.StartPoint().Row) + 1
+				matches = append(matches, SymbolRecord{
+					RelPath: relPath, Name: module, Kind: "import", StartLine: line, EndLine: line,
+					Signature: boundedText(text), Language: lang,
+					Evidence: "syntax-aware import path match; module resolution is not verified",
+				})
+			}
+			// Import nodes can contain nested nodes with the same type; the outer
+			// declaration is the one result users need.
+			return
+		}
+		for i := 0; i < int(node.NamedChildCount()); i++ {
+			walk(node.NamedChild(i))
+		}
+	}
+	walk(tree.RootNode())
+	return matches, nil
+}
+
+func isImporterNode(lang, nodeType string) bool {
+	switch lang {
+	case "go":
+		return nodeType == "import_spec"
+	case "java":
+		return nodeType == "import_declaration"
+	case "javascript", "typescript", "tsx":
+		return nodeType == "import_statement" || nodeType == "export_statement"
+	case "rust":
+		return nodeType == "use_declaration"
+	case "css", "scss", "sass":
+		return nodeType == "import_statement"
+	default:
+		return false
+	}
+}
+
+func importerLanguage(lang string) (*sitter.Language, bool) {
+	switch lang {
+	case "go":
+		return golang.GetLanguage(), true
+	case "java":
+		return java.GetLanguage(), true
+	case "javascript":
+		return javascript.GetLanguage(), true
+	case "typescript":
+		return tslang.GetLanguage(), true
+	case "tsx":
+		return tsxlang.GetLanguage(), true
+	case "rust":
+		return rustlang.GetLanguage(), true
+	case "css", "scss", "sass":
+		return csslang.GetLanguage(), true
+	default:
+		return nil, false
+	}
+}
+
+func importerPath(node *sitter.Node, source []byte, lang string) string {
+	if lang == "rust" || lang == "java" {
+		return string(source[node.StartByte():node.EndByte()])
+	}
+	var path string
+	var walk func(*sitter.Node)
+	walk = func(current *sitter.Node) {
+		if current == nil || path != "" {
+			return
+		}
+		if current.Type() == "string" || current.Type() == "interpreted_string_literal" || current.Type() == "raw_string_literal" || current.Type() == "string_value" {
+			raw := string(source[current.StartByte():current.EndByte()])
+			if unquoted, err := strconv.Unquote(raw); err == nil {
+				path = unquoted
+			} else {
+				path = strings.Trim(raw, "'\"` ")
+			}
+			return
+		}
+		for i := 0; i < int(current.NamedChildCount()); i++ {
+			walk(current.NamedChild(i))
+		}
+	}
+	walk(node)
+	return path
+}
+
+func importPathMatches(path, requested string) bool {
+	path = strings.TrimSpace(path)
+	requested = strings.TrimSpace(requested)
+	if path == "" || requested == "" {
+		return false
+	}
+	path = strings.NewReplacer("{", "", "}", "", ",", " ", "import ", "", "use ", "", "pub ", "").Replace(path)
+	if strings.TrimSpace(path) == requested {
+		return true
+	}
+	// Rust and Java import declarations may contain a qualified name or a
+	// grouped use tree. Match only at syntax separators, never within an
+	// identifier (for example, "foo" must not match "foobar").
+	quoted := regexp.QuoteMeta(requested)
+	re := regexp.MustCompile(`(?:^|[./:\s])` + quoted + `(?:$|[./:;\s])`)
+	return re.MatchString(path)
 }
 
 func FindReferences(db *sql.DB, projectPath, symbol string, limit int) ([]SymbolRecord, error) {
